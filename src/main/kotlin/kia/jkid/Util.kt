@@ -15,7 +15,7 @@ fun <T> Iterable<T>.joinToStringBuilder(
     return joinTo(stringBuilder, separator, prefix, postfix, limit, truncated) {
         if (callback == null) return@joinTo it.toString()
         callback(it)
-        ""
+        return@joinTo ""
     }
 }
 
