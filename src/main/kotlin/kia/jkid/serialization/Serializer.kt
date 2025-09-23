@@ -1,3 +1,16 @@
+/**
+ * JSON serialization utilities for the jkid sample.
+ *
+ * This file contains the reflection based implementation that converts arbitrary Kotlin objects
+ * into JSON strings. The implementation demonstrates:
+ *  - Discovering properties via Kotlin reflection (`memberProperties`).
+ *  - Honoring opt-out exclusion via [JsonExclude].
+ *  - Supporting custom JSON property names via [JsonName].
+ *  - Supporting pluggable per–property serializers via [CustomSerializer] / [ValueSerializer].
+ *  - Simple handling of primitive types, strings, lists and nested objects.
+ *
+ * The goal is clarity rather than performance. The API that callers use is [serialize].
+ */
 package kia.jkid.serialization
 
 import kia.jkid.CustomSerializer
@@ -12,9 +25,29 @@ import kotlin.reflect.full.createInstance
 import kotlin.reflect.full.findAnnotation
 import kotlin.reflect.full.memberProperties
 
+/**
+ * Serializes the supplied [obj] to a JSON string.
+ *
+ * This is the only public entry point in this file. It delegates to the reflection based
+ * [serializeObject] implementation which walks the object graph.
+ *
+ * Limitations:
+ *  - Cyclic object graphs are not detected and will cause a stack overflow.
+ *  - Only Lists are supported as collections (no Sets / Maps here).
+ *  - Numbers are rendered using their default `toString()` representation.
+ *
+ * @param obj any non-null object to serialize (may contain nullable properties internally).
+ * @return the JSON representation of [obj].
+ */
 fun serialize(obj: Any): String = buildString { serializeObject(obj) }
 
-/* the first implementation discussed in the book */
+/**
+ * Initial / simpler version shown in the book: serializes *all* properties without looking at
+ * annotations. Kept for reference and comparison. Not used by [serialize].
+ *
+ * @receiver the [StringBuilder] accumulating JSON.
+ * @param obj the object instance being serialized.
+ */
 private fun StringBuilder.serializeObjectWithoutAnnotation(obj: Any) {
     val kClass = obj::class as KClass<Any>
     val properties = kClass.memberProperties
@@ -26,6 +59,15 @@ private fun StringBuilder.serializeObjectWithoutAnnotation(obj: Any) {
     }
 }
 
+/**
+ * Serializes an object honoring the supported annotations:
+ *  - Skips properties annotated with [JsonExclude].
+ *  - Uses an alternative name from [JsonName] when present.
+ *  - Applies a custom value converter when [CustomSerializer] is present.
+ *
+ * @receiver the [StringBuilder] accumulating JSON.
+ * @param obj the object instance being serialized.
+ */
 private fun StringBuilder.serializeObject(obj: Any) {
     (obj::class as KClass<Any>)
         .memberProperties
@@ -35,6 +77,20 @@ private fun StringBuilder.serializeObject(obj: Any) {
         }
 }
 
+/**
+ * Serializes a single property: writes the (possibly overridden) JSON property name, a colon,
+ * and the computed JSON value for the property.
+ *
+ * Resolution order for the value:
+ *  1. If a custom serializer is declared via [CustomSerializer], its [ValueSerializer.toJsonValue]
+ *     result is used.
+ *  2. Otherwise the raw property value is used.
+ * The resulting value is then serialized by [serializePropertyValue].
+ *
+ * @receiver the [StringBuilder] accumulating JSON.
+ * @param prop the reflective property handle.
+ * @param obj the instance from which to read [prop].
+ */
 private fun StringBuilder.serializeProperty(
     prop: KProperty1<Any, *>, obj: Any
 ) {
@@ -48,6 +104,15 @@ private fun StringBuilder.serializeProperty(
     serializePropertyValue(jsonValue)
 }
 
+/**
+ * Looks for a [CustomSerializer] annotation on the property and, if present, returns an instance
+ * of the declared [ValueSerializer]. Objects are created via `objectInstance` if the serializer
+ * is declared as an object, else via [createInstance].
+ *
+ * @receiver the reflective property.
+ * @return a [ValueSerializer] to transform the property value prior to JSON serialization, or
+ * `null` if none is specified.
+ */
 fun KProperty<*>.getSerializer(): ValueSerializer<Any?>? {
     val customSerializerAnn = findAnnotation<CustomSerializer>() ?: return null
     val serializerClass = customSerializerAnn.serializerClass
@@ -58,6 +123,19 @@ fun KProperty<*>.getSerializer(): ValueSerializer<Any?>? {
     return valueSerializer as ValueSerializer<Any?>
 }
 
+/**
+ * Serializes an arbitrary value based on its runtime type.
+ *
+ * Supported kinds:
+ *  - null (written as the literal `null`)
+ *  - String (escaped via [serializeString])
+ *  - Number / Boolean (verbatim `toString()`)
+ *  - List (delegated to [serializeList])
+ *  - Any other object (recursively serialized via [serializeObject])
+ *
+ * @receiver the accumulating JSON [StringBuilder].
+ * @param value the value to serialize (may be null).
+ */
 private fun StringBuilder.serializePropertyValue(value: Any?) {
     when (value) {
         null -> append("null")
@@ -68,18 +146,42 @@ private fun StringBuilder.serializePropertyValue(value: Any?) {
     }
 }
 
+/**
+ * Serializes a list of values (possibly heterogeneous) into a JSON array.
+ *
+ * @receiver the accumulating JSON [StringBuilder].
+ * @param data the list to serialize; elements may be null or nested objects.
+ */
 private fun StringBuilder.serializeList(data: List<Any?>) {
     data.joinToStringBuilder(this, prefix = "[", postfix = "]") {
         serializePropertyValue(it)
     }
 }
 
+/**
+ * Serializes a raw String value, adding surrounding quotes and escaping special characters.
+ * Delegates per-character escaping logic to [Char.escape].
+ *
+ * @receiver the accumulating JSON [StringBuilder].
+ * @param s the raw (unescaped) string value.
+ */
 private fun StringBuilder.serializeString(s: String) {
     append('\"')
     s.forEach { append(it.escape()) }
     append('\"')
 }
 
+/**
+ * Returns the escaped representation for a single character suitable for inclusion inside a JSON
+ * string literal. Characters that do not need escaping are returned unchanged. The return type is
+ * `Any` simply because the original implementation appends either a `String` escape sequence or
+ * the original `Char` directly; both are acceptable to [StringBuilder.append].
+ *
+ * Escaped characters: backslash, double quote, backspace, form-feed, newline, carriage return, tab.
+ *
+ * @receiver the character to escape.
+ * @return either the original character or the corresponding escape sequence as a String.
+ */
 private fun Char.escape(): Any =
     when (this) {
         '\\' -> "\\\\"
