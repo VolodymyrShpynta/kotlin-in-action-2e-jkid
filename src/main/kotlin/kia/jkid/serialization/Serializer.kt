@@ -142,6 +142,7 @@ private fun StringBuilder.serializePropertyValue(value: Any?) {
         is String -> serializeString(value)
         is Number, is Boolean -> append(value.toString())
         is List<*> -> serializeList(value)
+        is Map<*, *> -> serializeMap(value)
         else -> serializeObject(value)
     }
 }
@@ -155,6 +156,32 @@ private fun StringBuilder.serializePropertyValue(value: Any?) {
 private fun StringBuilder.serializeList(data: List<Any?>) {
     data.joinToStringBuilder(this, prefix = "[", postfix = "]") {
         serializePropertyValue(it)
+    }
+}
+
+/**
+ * Serializes a Map as a JSON object, but only if all keys are "simple":
+ * String, Number, Boolean or Enum. Enum keys use their name.
+ *
+ * If any key is null or not one of the supported types, an [IllegalArgumentException] is thrown.
+ * This avoids ambiguous or lossy encodings for complex key objects.
+ */
+private fun StringBuilder.serializeMap(data: Map<*, Any?>) {
+    data.entries.joinToStringBuilder(this, prefix = "{", postfix = "}") { (k, v) ->
+        val keyStr = when (k) {
+            is String -> k
+            is Number, is Boolean -> k.toString()
+            is Enum<*> -> k.name
+            else -> {
+                val typeDesc = k?.let { "of type ${it::class.qualifiedName}" } ?: "null"
+                throw IllegalArgumentException(
+                    "Cannot serialize map: non-simple key $typeDesc. Supported key types: String, Number, Boolean, Enum."
+                )
+            }
+        }
+        serializeString(keyStr)
+        append(": ")
+        serializePropertyValue(v)
     }
 }
 
