@@ -24,6 +24,12 @@ import kotlin.reflect.full.starProjectedType
  *  - Lists: handled by [ValueListSeed] (primitive elements) and [ObjectListSeed] (object / composite elements).
  *  - Maps: handled by [ValueMapSeed] (primitive values) and [ObjectMapSeed] (object / composite values). Keys must be
  *          simple (String, Number, Boolean, Enum). Complex key objects are not supported (mirrors serializer rules).
+ *
+ * Design & limitations:
+ *  - No detection of cyclic references (recursion will overflow the stack for cycles).
+ *  - Only `List` and `Map` are recognized as collection types; `Set`, `Mutable*` variants, etc. are not.
+ *  - Map keys are always sourced from JSON object field names (JSON syntax only allows string keys).
+ *  - Structured (non-simple) keys are rejected early to avoid ambiguous conversions.
  */
 
 /**
@@ -94,7 +100,9 @@ interface Seed : JsonObject {
     val classInfoCache: ClassInfoCache
 
     /**
-     * Finalize and produce the runtime value represented by this seed (may return null for primitives).
+     * Finalizes and produces the runtime value represented by this seed.
+     * For composite structures this recursively spawns child seeds; for primitive collections
+     * it returns the accumulated values directly.
      */
     fun spawn(): Any?
 
@@ -102,13 +110,13 @@ interface Seed : JsonObject {
      * Create a nested composite (object or list) property seed.
      *
      * @param propertyName name in JSON / constructor
-     * @param isList whether the requested structure is an array
+     * @param isArray whether the requested structure is an array
      */
-    fun createCompositeProperty(propertyName: String, isList: Boolean): JsonObject
+    fun createPropertySeed(propertyName: String, isArray: Boolean): JsonObject
 
-    override fun createObject(propertyName: String) = createCompositeProperty(propertyName, false)
+    override fun createObject(propertyName: String) = createPropertySeed(propertyName, false)
 
-    override fun createArray(propertyName: String) = createCompositeProperty(propertyName, true)
+    override fun createArray(propertyName: String) = createPropertySeed(propertyName, true)
 }
 
 /**
@@ -148,7 +156,26 @@ private fun isEnumType(type: KType): Boolean = (type.classifier as? KClass<*>)?.
 /** Determine if [type] is a simple map key type (String, Number, Boolean, Enum). */
 private fun isSimpleMapKeyType(type: KType): Boolean = type.isPrimitiveOrString() || isEnumType(type)
 
-/** Factory creating appropriate Seed for property type (object / list / map). */
+/**
+ * Factory creating an appropriate [Seed] for the supplied (possibly annotated) [paramType].
+ *
+ * @param paramType Kotlin reflection type of the target property / constructor parameter (post-@Deserialize override).
+ * @param isList Indicates the JSON shape at this position: true if the parser just saw a '[' and
+ *               expects an array, false if it saw '{' or is resolving an object property.
+ *
+ * Behavior:
+ *  - If [paramType] is a subtype of `List<*>` then an array JSON shape is required. The element type's
+ *    classification (primitive vs object) chooses [ValueListSeed] vs [ObjectListSeed].
+ *  - If [paramType] is a subtype of `Map<*, *>` a JSON *object* shape is required (not a JSON array).
+ *    The value type classification picks [ValueMapSeed] vs [ObjectMapSeed]. Keys are validated to be simple.
+ *  - Otherwise a plain [ObjectSeed] is produced (still represented by a JSON object in the input).
+ *
+ * Validation:
+ *  - Shape mismatches (expecting array vs object) raise a [JKidException] with a clear message.
+ *  - Unsupported map key types raise immediately; we fail fast before descending into values.
+ *
+ * Note: The boolean is named `isList` for historical reasons – it really means "JSON array expected here".
+ */
 fun Seed.createSeedForType(paramType: KType, isList: Boolean): Seed {
     val paramClass = paramType.classifier as KClass<out Any>
     if (isSubtypeOfList(paramType)) {
@@ -169,8 +196,10 @@ fun Seed.createSeedForType(paramType: KType, isList: Boolean): Seed {
 }
 
 /**
- * Seed that accumulates constructor arguments for a Kotlin class and eventually instantiates it.
- *
+ * Collects constructor arguments for a Kotlin class instance. Primitive values are stored directly;
+ * nested objects / arrays / maps are delegated to child [Seed] instances tracked in [seedArguments].
+ * When [spawn] is invoked, all child seeds are spawned and merged with primitive arguments, then the
+ * reflective constructor is called.
  * @param T target class type
  * @property classInfoCache shared cache for looking up [ClassInfo]
  */
@@ -198,13 +227,11 @@ class ObjectSeed<out T : Any>(
     }
 
     /** Create a child seed (object or list), possibly honoring a @Deserialize annotation override. */
-    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+    override fun createPropertySeed(propertyName: String, isArray: Boolean): Seed {
         val param = classInfo.getConstructorParameter(propertyName)
         val deserializeAs = classInfo.getDeserializeClass(propertyName)?.starProjectedType
-        val seed = createSeedForType(
-            deserializeAs ?: param.type, isList
-        )
-        return seed.apply { seedArguments[param] = this }
+        return createSeedForType(deserializeAs ?: param.type, isArray)
+            .also { seedArguments[param] = it }
     }
 
     /** Instantiate the target class using the collected constructor arguments. */
@@ -226,8 +253,9 @@ class ObjectListSeed(
         throw JKidException("Found primitive value in collection of object types")
     }
 
-    override fun createCompositeProperty(propertyName: String, isList: Boolean) =
-        createSeedForType(elementType, isList).apply { elements.add(this) }
+    override fun createPropertySeed(propertyName: String, isArray: Boolean) =
+        createSeedForType(elementType, isArray)
+            .also { elements.add(it) }
 
     /** Produce the final list by spawning all collected element seeds. */
     override fun spawn(): List<*> = elements.map { it.spawn() }
@@ -248,7 +276,7 @@ class ValueListSeed(
         elements.add(serializerForType.fromJsonValue(value))
     }
 
-    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+    override fun createPropertySeed(propertyName: String, isArray: Boolean): Seed {
         throw JKidException("Found object value in collection of primitive types")
     }
 
@@ -270,7 +298,7 @@ class ValueMapSeed(
         map[key] = valueSerializer.fromJsonValue(value)
     }
 
-    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+    override fun createPropertySeed(propertyName: String, isArray: Boolean): Seed {
         throw JKidException("Found composite value in map of primitive values")
     }
 
@@ -292,22 +320,37 @@ class ObjectMapSeed(
         throw JKidException("Found primitive value in map of object values")
     }
 
-    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+    override fun createPropertySeed(propertyName: String, isArray: Boolean): Seed {
         val key = convertSimpleKey(propertyName, keyType)
-        val child = createSeedForType(valueType, isList)
-        map[key] = child
-        return child
+        return createSeedForType(valueType, isArray)
+            .also { map[key] = it }
     }
 
     /** Return the accumulated map. */
     override fun spawn(): Map<Any, Any?> = map.mapValues { it.value.spawn() }
 }
 
-/** Helper to parse a string into a target type or throw a JKidException with a uniform message. */
+/**
+ * Attempts the given [convert] function and throws a [JKidException] with a consistent message if it fails.
+ * Used to keep numeric / boolean key parsing branches concise.
+ */
 private inline fun <T> String.parseOrFail(typeName: String, convert: (String) -> T?): T =
     convert(this) ?: throw JKidException("Invalid $typeName map key '$this'")
 
-/** Convert a simple key string into the target simple key type (String/Number/Boolean/Enum). */
+/**
+ * Converts a raw JSON object field name into a strongly-typed map key. Supported key target types:
+ *  - String (identity)
+ *  - Integral / floating numeric primitives (via `toXxxOrNull` with validation)
+ *  - Boolean (strict: only "true" or "false")
+ *  - Enum (exact constant name match)
+ *
+ * Error modes:
+ *  - Malformed lexeme -> descriptive [JKidException] (e.g. "Invalid Int map key '01x'").
+ *  - Enum mismatch -> lists enum type in message.
+ *  - Unsupported target type -> early failure (should not happen if pre-validated in [getMapKeyType]).
+ *
+ * Rationale for strict boolean parsing: avoids silently accepting ambiguous keys like "True" / "1".
+ */
 private fun convertSimpleKey(raw: String, keyType: KType): Any {
     return when (val kClass = keyType.classifier as KClass<*>) {
         String::class -> raw
