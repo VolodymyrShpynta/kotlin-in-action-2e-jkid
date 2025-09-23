@@ -8,20 +8,22 @@ import kotlin.reflect.KClass
 import kotlin.reflect.KParameter
 import kotlin.reflect.KType
 import kotlin.reflect.full.isSubtypeOf
+import kotlin.reflect.full.isSubclassOf
 import kotlin.reflect.full.starProjectedType
 
 /**
  * Top-level entry points and internal machinery for turning JSON text into Kotlin objects.
  *
- * The deserialization process is staged:
- * 1. A root [Seed] implementation (usually an [ObjectSeed]) is created for the target class.
- * 2. A streaming [Parser] walks through the JSON and calls back into the active [Seed] hierarchy.
- * 3. Each [Seed] collects primitive values or creates nested seeds for objects / arrays.
- * 4. After parsing finishes, [Seed.spawn] materializes the actual object graph (invoking constructors).
+ * Stages:
+ * 1. A root [Seed] (usually [ObjectSeed]) is created for the target class.
+ * 2. A streaming [Parser] walks tokens and delegates to active [Seed]s.
+ * 3. Seeds accumulate primitive values or nested child seeds (objects / lists / maps).
+ * 4. After parsing, [Seed.spawn] materializes the object graph.
  *
- * Lists are treated specially: we distinguish between lists of primitive values ([ValueListSeed]) and
- * lists of objects ([ObjectListSeed]). Type information (possibly overridden via annotations) drives
- * which seed type is created.
+ * Collections:
+ *  - Lists: handled by [ValueListSeed] (primitive elements) and [ObjectListSeed] (object / composite elements).
+ *  - Maps: handled by [ValueMapSeed] (primitive values) and [ObjectMapSeed] (object / composite values). Keys must be
+ *          simple (String, Number, Boolean, Enum). Complex key objects are not supported (mirrors serializer rules).
  */
 
 /**
@@ -32,7 +34,7 @@ import kotlin.reflect.full.starProjectedType
  * @return a fully constructed instance of [T]
  * @throws JKidException if JSON structure does not match the target type requirements
  */
-inline fun <reified T: Any> deserialize(json: String): T {
+inline fun <reified T : Any> deserialize(json: String): T {
     return deserialize(StringReader(json))
 }
 
@@ -44,7 +46,7 @@ inline fun <reified T: Any> deserialize(json: String): T {
  * @param T target Kotlin type (must be a non-nullable class type)
  * @param json JSON reader supplying the document
  */
-inline fun <reified T: Any> deserialize(json: Reader): T {
+inline fun <reified T : Any> deserialize(json: Reader): T {
     return deserialize(json, T::class)
 }
 
@@ -56,7 +58,7 @@ inline fun <reified T: Any> deserialize(json: Reader): T {
  * @return constructed instance of [T]
  * @throws JKidException when structure / types are incompatible
  */
-fun <T: Any> deserialize(json: Reader, targetClass: KClass<T>): T {
+fun <T : Any> deserialize(json: Reader, targetClass: KClass<T>): T {
     val seed = ObjectSeed(targetClass, ClassInfoCache())
     Parser(json, seed).parse()
     return seed.spawn()
@@ -87,7 +89,7 @@ interface JsonObject {
  * A [JsonObject] that knows how to eventually produce a Kotlin value (object, list, primitive list)
  * once parsing has finished.
  */
-interface Seed: JsonObject {
+interface Seed : JsonObject {
     /** Shared reflection cache for class metadata & annotations. */
     val classInfoCache: ClassInfoCache
 
@@ -112,41 +114,55 @@ interface Seed: JsonObject {
 /**
  * Determine if [type] is a (possibly generic) subtype of [List]. Internal helper.
  */
-private fun isSubtypeOfList(type: KType): Boolean {
-    val listType: KType = List::class.starProjectedType
-    return type.isSubtypeOf(listType)
-}
+private fun isSubtypeOfList(type: KType): Boolean = type.isSubtypeOf(List::class.starProjectedType)
+
+/**
+ * Determine if [type] is a (possibly generic) subtype of [Map]. Internal helper.
+ */
+private fun isSubtypeOfMap(type: KType): Boolean = type.isSubtypeOf(Map::class.starProjectedType)
 
 /**
  * Extract the single generic type parameter (e.g., T from List<T>). Assumes exactly one argument.
  */
-private fun getParameterizedType(type: KType): KType {
-    return type.arguments.single().type!!
-}
+private fun getSingleTypeArg(type: KType): KType = type.arguments.single().type!!
 
 /**
- * Factory helper for creating an appropriate [Seed] instance for a given parameter type.
- *
- * Handles:
- * - Lists of primitives -> [ValueListSeed]
- * - Lists of objects -> [ObjectListSeed]
- * - Plain objects -> [ObjectSeed]
- *
- * @param paramType the (possibly annotated / substituted) Kotlin type for the property
- * @param isList whether the parser context expects a JSON array at this point
- * @throws JKidException when array vs object expectations mismatch or unsupported shapes are found
+ * Get the key type of map (e.g., T from Map<T, V>).
  */
+private fun getMapKeyType(type: KType): KType =
+    type.arguments[0].type!!
+        .also {
+            if (!isSimpleMapKeyType(it)) {
+                throw JKidException("Unsupported map key type ${it.classifier}. Only String/Number/Boolean/Enum keys are supported.")
+            }
+        }
+
+/**
+ * Get the value type of map (e.g., V from Map<T, V>).
+ */
+private fun getMapValueType(type: KType): KType = type.arguments[1].type!!
+
+/** Determine if [type] is an enum type. */
+private fun isEnumType(type: KType): Boolean = (type.classifier as? KClass<*>)?.isSubclassOf(Enum::class) == true
+
+/** Determine if [type] is a simple map key type (String, Number, Boolean, Enum). */
+private fun isSimpleMapKeyType(type: KType): Boolean = type.isPrimitiveOrString() || isEnumType(type)
+
+/** Factory creating appropriate Seed for property type (object / list / map). */
 fun Seed.createSeedForType(paramType: KType, isList: Boolean): Seed {
     val paramClass = paramType.classifier as KClass<out Any>
     if (isSubtypeOfList(paramType)) {
-        println("It's a list!")
         if (!isList) throw JKidException("An array expected, not a composite object")
-
-        val elementType = getParameterizedType(paramType)
-        if (elementType.isPrimitiveOrString()) {
-            return ValueListSeed(elementType, classInfoCache)
-        }
-        return ObjectListSeed(elementType, classInfoCache)
+        val elementType = getSingleTypeArg(paramType)
+        return if (elementType.isPrimitiveOrString()) ValueListSeed(elementType, classInfoCache)
+        else ObjectListSeed(elementType, classInfoCache)
+    }
+    if (isSubtypeOfMap(paramType)) {
+        if (isList) throw JKidException("Object of the type $paramType expected, not an array")
+        val keyType = getMapKeyType(paramType)
+        val valueType = getMapValueType(paramType)
+        return if (valueType.isPrimitiveOrString()) ValueMapSeed(keyType, valueType, classInfoCache)
+        else ObjectMapSeed(keyType, valueType, classInfoCache)
     }
     if (isList) throw JKidException("Object of the type $paramType expected, not an array")
     return ObjectSeed(paramClass, classInfoCache)
@@ -158,15 +174,16 @@ fun Seed.createSeedForType(paramType: KType, isList: Boolean): Seed {
  * @param T target class type
  * @property classInfoCache shared cache for looking up [ClassInfo]
  */
-class ObjectSeed<out T: Any>(
-        targetClass: KClass<T>,
-        override val classInfoCache: ClassInfoCache
+class ObjectSeed<out T : Any>(
+    targetClass: KClass<T>,
+    override val classInfoCache: ClassInfoCache
 ) : Seed {
 
     private val classInfo: ClassInfo<T> = classInfoCache[targetClass]
 
     /** Primitive / simple argument values keyed by constructor parameter. */
     private val valueArguments = mutableMapOf<KParameter, Any?>()
+
     /** Nested object/list arguments captured as child seeds. */
     private val seedArguments = mutableMapOf<KParameter, Seed>()
 
@@ -200,8 +217,8 @@ class ObjectSeed<out T: Any>(
  * @property elementType Kotlin type of each element in the list
  */
 class ObjectListSeed(
-    val elementType: KType,
-        override val classInfoCache: ClassInfoCache
+    private val elementType: KType,
+    override val classInfoCache: ClassInfoCache
 ) : Seed {
     private val elements = mutableListOf<Seed>()
 
@@ -210,7 +227,7 @@ class ObjectListSeed(
     }
 
     override fun createCompositeProperty(propertyName: String, isList: Boolean) =
-            createSeedForType(elementType, isList).apply { elements.add(this) }
+        createSeedForType(elementType, isList).apply { elements.add(this) }
 
     /** Produce the final list by spawning all collected element seeds. */
     override fun spawn(): List<*> = elements.map { it.spawn() }
@@ -221,7 +238,7 @@ class ObjectListSeed(
  */
 class ValueListSeed(
     elementType: KType,
-        override val classInfoCache: ClassInfoCache
+    override val classInfoCache: ClassInfoCache
 ) : Seed {
     private val elements = mutableListOf<Any?>()
     private val serializerForType = serializerForBasicType(elementType)
@@ -236,5 +253,81 @@ class ValueListSeed(
     }
 
     /** Return the accumulated primitive list. */
-    override fun spawn() = elements
+    override fun spawn(): List<Any?> = elements
 }
+
+/** Map with primitive/simple values. */
+class ValueMapSeed(
+    private val keyType: KType,
+    private val valueType: KType,
+    override val classInfoCache: ClassInfoCache
+) : Seed {
+    private val map = linkedMapOf<Any, Any?>()
+    private val valueSerializer = serializerForBasicType(valueType)
+
+    override fun setSimpleProperty(propertyName: String, value: Any?) {
+        val key = convertKey(propertyName)
+        map[key] = valueSerializer.fromJsonValue(value)
+    }
+
+    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+        throw JKidException("Found composite value in map of primitive values")
+    }
+
+    /** Return the accumulated map. */
+    override fun spawn(): Map<Any, Any?> = map
+
+    private fun convertKey(raw: String): Any = convertSimpleKey(raw, keyType)
+}
+
+/** Map with object / composite values. */
+class ObjectMapSeed(
+    private val keyType: KType,
+    private val valueType: KType,
+    override val classInfoCache: ClassInfoCache
+) : Seed {
+    private val map = linkedMapOf<Any, Seed>()
+
+    override fun setSimpleProperty(propertyName: String, value: Any?) {
+        throw JKidException("Found primitive value in map of object values")
+    }
+
+    override fun createCompositeProperty(propertyName: String, isList: Boolean): Seed {
+        val key = convertSimpleKey(propertyName, keyType)
+        val child = createSeedForType(valueType, isList)
+        map[key] = child
+        return child
+    }
+
+    /** Return the accumulated map. */
+    override fun spawn(): Map<Any, Any?> = map.mapValues { it.value.spawn() }
+}
+
+/** Helper to parse a string into a target type or throw a JKidException with a uniform message. */
+private inline fun <T> String.parseOrFail(typeName: String, convert: (String) -> T?): T =
+    convert(this) ?: throw JKidException("Invalid $typeName map key '$this'")
+
+/** Convert a simple key string into the target simple key type (String/Number/Boolean/Enum). */
+private fun convertSimpleKey(raw: String, keyType: KType): Any {
+    return when (val kClass = keyType.classifier as KClass<*>) {
+        String::class -> raw
+        Int::class -> raw.parseOrFail("Int") { it.toIntOrNull() }
+        Long::class -> raw.parseOrFail("Long") { it.toLongOrNull() }
+        Short::class -> raw.parseOrFail("Short") { it.toShortOrNull() }
+        Byte::class -> raw.parseOrFail("Byte") { it.toByteOrNull() }
+        Float::class -> raw.parseOrFail("Float") { it.toFloatOrNull() }
+        Double::class -> raw.parseOrFail("Double") { it.toDoubleOrNull() }
+        Boolean::class -> raw.parseOrFail("Boolean") { it.toBooleanStrictOrNull() }
+        else -> if (kClass.isSubclassOf(Enum::class)) {
+            enumValueOfOrNull(kClass, raw)
+                ?: throw JKidException("Invalid enum key '$raw' for ${kClass.simpleName}")
+        } else {
+            throw JKidException("Unsupported map key type ${kClass.qualifiedName}")
+        }
+    }
+}
+
+@Suppress("UNCHECKED_CAST")
+private fun enumValueOfOrNull(enumKClass: KClass<*>, name: String): Any? =
+    (enumKClass.java.enumConstants as Array<Enum<*>>?)
+        ?.firstOrNull { it.name == name }
