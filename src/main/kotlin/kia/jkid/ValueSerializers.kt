@@ -1,6 +1,9 @@
 package kia.jkid
 
+import kia.jkid.StringSerializer.toJsonValue
 import kia.jkid.deserialization.JKidException
+import java.text.SimpleDateFormat
+import java.util.Date
 import kotlin.reflect.KType
 import kotlin.reflect.typeOf
 
@@ -31,18 +34,19 @@ fun serializerForBasicType(type: KType): ValueSerializer<out Any?> {
  * represented by the same serializers (null handling is typically performed at a higher layer).
  */
 fun serializerForType(type: KType): ValueSerializer<out Any?>? =
-        when (type) {
-            typeOf<Byte>() -> ByteSerializer
-            typeOf<Short>() -> ShortSerializer
-            typeOf<Int>() -> IntSerializer
-            typeOf<Long>() -> LongSerializer
-            typeOf<Float>() -> FloatSerializer
-            typeOf<Double>() -> DoubleSerializer
-            typeOf<Boolean>() -> BooleanSerializer
-            typeOf<String>(),
-            typeOf<String?>() -> StringSerializer
-            else -> null
-        }
+    when (type) {
+        typeOf<Byte>() -> ByteSerializer
+        typeOf<Short>() -> ShortSerializer
+        typeOf<Int>() -> IntSerializer
+        typeOf<Long>() -> LongSerializer
+        typeOf<Float>() -> FloatSerializer
+        typeOf<Double>() -> DoubleSerializer
+        typeOf<Boolean>() -> BooleanSerializer
+        typeOf<String>(),
+        typeOf<String?>() -> StringSerializer
+
+        else -> null
+    }
 
 /**
  * Helper ensuring the receiver is a [Number]. Used by numeric serializers to give a uniform
@@ -62,6 +66,7 @@ private fun Any?.expectNumber(): Number {
 object ByteSerializer : ValueSerializer<Byte> {
     /** Converts a numeric JSON value to [Byte], throwing if not numeric. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toByte()
+
     /** Returns the byte as-is for JSON emission. */
     override fun toJsonValue(value: Byte) = value
 }
@@ -72,6 +77,7 @@ object ByteSerializer : ValueSerializer<Byte> {
 object ShortSerializer : ValueSerializer<Short> {
     /** Converts a numeric JSON value to [Short]. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toShort()
+
     /** Returns the short as-is for JSON emission. */
     override fun toJsonValue(value: Short) = value
 }
@@ -80,6 +86,7 @@ object ShortSerializer : ValueSerializer<Short> {
 object IntSerializer : ValueSerializer<Int> {
     /** Converts a numeric JSON value to [Int]. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toInt()
+
     /** Returns the int as-is for JSON emission. */
     override fun toJsonValue(value: Int) = value
 }
@@ -88,6 +95,7 @@ object IntSerializer : ValueSerializer<Int> {
 object LongSerializer : ValueSerializer<Long> {
     /** Converts a numeric JSON value to [Long]. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toLong()
+
     /** Returns the long as-is for JSON emission. */
     override fun toJsonValue(value: Long) = value
 }
@@ -96,6 +104,7 @@ object LongSerializer : ValueSerializer<Long> {
 object FloatSerializer : ValueSerializer<Float> {
     /** Converts a numeric JSON value to [Float]. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toFloat()
+
     /** Returns the float as-is for JSON emission. */
     override fun toJsonValue(value: Float) = value
 }
@@ -104,6 +113,7 @@ object FloatSerializer : ValueSerializer<Float> {
 object DoubleSerializer : ValueSerializer<Double> {
     /** Converts a numeric JSON value to [Double]. */
     override fun fromJsonValue(jsonValue: Any?) = jsonValue.expectNumber().toDouble()
+
     /** Returns the double as-is for JSON emission. */
     override fun toJsonValue(value: Double) = value
 }
@@ -150,4 +160,49 @@ object StringSerializer : ValueSerializer<String?> {
      * Returns the given value unchanged. Strings (and null) map 1:1 to JSON primitives.
      */
     override fun toJsonValue(value: String?) = value
+}
+
+/**
+ * Serializer for [Date] values using a custom date format.
+ *
+ * @constructor Creates a [DateSerializer] with the specified [dateFormat].
+ * @property formatter Internal [SimpleDateFormat] used for parsing and formatting dates.
+ *
+ * The [dateFormat] string must be compatible with [SimpleDateFormat].
+ *
+ * Example usage:
+ *   val serializer = DateSerializer("yyyy-MM-dd")
+ *   val date = serializer.fromJsonValue("2025-09-26")
+ *   val json = serializer.toJsonValue(date)
+ */
+class DateSerializer(dateFormat: String) : ValueSerializer<Date> {
+    /**
+     * Internal [SimpleDateFormat] instance initialized with [dateFormat].
+     * Used for parsing and formatting [Date] objects.
+     */
+    private val formatter = SimpleDateFormat(dateFormat)
+
+    /**
+     * Converts a JSON value to a [Date] object.
+     *
+     * @param jsonValue The JSON value to parse. Must be a [String] in the expected date format.
+     * @return The parsed [Date] object.
+     * @throws JKidException If [jsonValue] is not a [String] or cannot be parsed as a date.
+     */
+    override fun fromJsonValue(jsonValue: Any?): Date {
+        require(jsonValue is String) { "Expected string for date, was: $jsonValue" }
+        return runCatching { formatter.parse(jsonValue) }
+            .getOrNull()
+            ?: throw JKidException("Failed to parse date: $jsonValue")
+    }
+
+    /**
+     * Converts a [Date] object to its JSON string representation.
+     *
+     * @param value The [Date] to format.
+     * @return The formatted date string.
+     */
+    override fun toJsonValue(value: Date): Any {
+        return formatter.format(value)
+    }
 }

@@ -14,9 +14,11 @@
 package kia.jkid.serialization
 
 import kia.jkid.CustomSerializer
+import kia.jkid.DateSerializer
 import kia.jkid.JsonExclude
 import kia.jkid.JsonName
 import kia.jkid.ValueSerializer
+import kia.jkid.exercise.DateFormat
 import kia.jkid.joinToStringBuilder
 import kotlin.reflect.KClass
 import kotlin.reflect.KProperty
@@ -105,15 +107,40 @@ private fun StringBuilder.serializeProperty(
 }
 
 /**
- * Looks for a [CustomSerializer] annotation on the property and, if present, returns an instance
- * of the declared [ValueSerializer]. Objects are created via `objectInstance` if the serializer
- * is declared as an object, else via [createInstance].
+ * Returns a [ValueSerializer] for the property if a custom serializer or date format annotation is present.
  *
- * @receiver the reflective property.
- * @return a [ValueSerializer] to transform the property value prior to JSON serialization, or
- * `null` if none is specified.
+ * Resolution order:
+ * 1. If a [CustomSerializer] annotation is present, returns its serializer.
+ * 2. If a [DateFormat] annotation is present, returns a [DateSerializer] for the format.
+ * 3. Otherwise, returns null.
+ *
+ * @receiver The property to inspect for serializer annotations.
+ * @return The [ValueSerializer] instance, or null if none found.
  */
-fun KProperty<*>.getSerializer(): ValueSerializer<Any?>? {
+fun KProperty<*>.getSerializer(): ValueSerializer<Any?>? =
+    getCustomSerializer() ?: getDateSerializer()
+
+/**
+ * Returns a [DateSerializer] for the property if a [DateFormat] annotation is present.
+ *
+ * @receiver The property to inspect for a [DateFormat] annotation.
+ * @return The [DateSerializer] instance, or null if not annotated.
+ */
+private fun KProperty<*>.getDateSerializer(): ValueSerializer<Any?>? =
+    findAnnotation<DateFormat>()?.let {
+        @Suppress("UNCHECKED_CAST")
+        DateSerializer(it.format) as ValueSerializer<Any?>
+    }
+
+/**
+ * Returns a custom [ValueSerializer] for the property if a [CustomSerializer] annotation is present.
+ *
+ * Instantiates the serializer class via its object instance or no-arg constructor.
+ *
+ * @receiver The property to inspect for a [CustomSerializer] annotation.
+ * @return The [ValueSerializer] instance, or null if not annotated.
+ */
+private fun KProperty<*>.getCustomSerializer(): ValueSerializer<Any?>? {
     val customSerializerAnn = findAnnotation<CustomSerializer>() ?: return null
     val serializerClass = customSerializerAnn.serializerClass
 

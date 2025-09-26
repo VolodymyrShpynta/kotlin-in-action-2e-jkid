@@ -148,4 +148,8 @@ class ClassInfo<T : Any>(cls: KClass<T>) {
 }
 
 /** General-purpose exception type used for errors encountered during serialization/deserialization. */
-class JKidException(message: String) : Exception(message)
+class JKidException(message: String) : Exception(message) {
+    constructor(message: String, cause: Throwable) : this(message) {
+        initCause(cause)
+    }
+}
